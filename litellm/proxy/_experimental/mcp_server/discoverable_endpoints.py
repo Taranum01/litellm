@@ -1,6 +1,7 @@
 import asyncio
 import html as _html
 import json
+import secrets
 import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple
@@ -135,6 +136,61 @@ def decode_state_hash(encrypted_state: str) -> dict:
 
     state_data = json.loads(decrypted_json)
     return state_data
+
+
+# LIT-4197: some upstream authorization servers reject an over-long ``state``
+# (the encrypted OAuth session blob routinely exceeds their limit). The upstream
+# only needs an opaque value it echoes back on ``/callback``, so we forward a
+# short random handle and keep the encrypted session in a per-flow HttpOnly
+# cookie bound to that handle. The browser carries the cookie across the
+# upstream round trip, so the flow stays correct with no server-side session
+# store (works across proxy replicas, unlike an in-process map).
+_OAUTH_STATE_COOKIE_PREFIX = "mcp_oauth_state_"
+_OAUTH_STATE_COOKIE_TTL_SECONDS = 600
+_OAUTH_STATE_HANDLE_BYTES = 32
+
+
+def _oauth_state_cookie_name(relay_state: str) -> str:
+    return f"{_OAUTH_STATE_COOKIE_PREFIX}{relay_state}"
+
+
+def _set_oauth_state_cookie(
+    response: RedirectResponse,
+    request: Request,
+    relay_state: str,
+    encoded_state: str,
+) -> None:
+    parsed = urlparse(get_request_base_url(request))
+    response.set_cookie(
+        key=_oauth_state_cookie_name(relay_state),
+        value=encoded_state,
+        max_age=_OAUTH_STATE_COOKIE_TTL_SECONDS,
+        path=parsed.path or "/",
+        secure=parsed.scheme == "https",
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def _resolve_encoded_oauth_state(request: Request, state: str) -> str:
+    """Return the encrypted OAuth session for a ``/callback`` request.
+
+    New flows carry it in a per-flow cookie keyed by the short handle we
+    forwarded upstream (the IdP echoes that handle back as ``state``). Flows
+    started before this change - or in flight across a deploy - carry the
+    encrypted blob directly in ``state``, so fall back to it when the cookie
+    is absent.
+    """
+    cookie_value = request.cookies.get(_oauth_state_cookie_name(state))
+    return cookie_value if cookie_value else state
+
+
+def _clear_oauth_state_cookie(response: RedirectResponse, request: Request, state: str) -> None:
+    cookie_name = _oauth_state_cookie_name(state)
+    if cookie_name not in request.cookies:
+        return
+    parsed = urlparse(get_request_base_url(request))
+    response.delete_cookie(key=cookie_name, path=parsed.path or "/")
 
 
 def _get_validated_client_redirect_uri(request: Request, state_data: Dict[str, Any]) -> str:
@@ -462,11 +518,12 @@ async def authorize_with_server(
         code_challenge_method=code_challenge_method,
         client_redirect_uri=redirect_uri,
     )
+    relay_state = secrets.token_urlsafe(_OAUTH_STATE_HANDLE_BYTES)
 
     params = {
         "client_id": mcp_server.client_id if mcp_server.client_id else client_id,
         "redirect_uri": f"{request_base_url}/callback",
-        "state": encoded_state,
+        "state": relay_state,
         "response_type": response_type or "code",
     }
     if scope:
@@ -483,7 +540,9 @@ async def authorize_with_server(
     existing_params = dict(parse_qsl(parsed_auth_url.query))
     existing_params.update(params)
     final_url = urlunparse(parsed_auth_url._replace(query=urlencode(existing_params)))
-    return RedirectResponse(final_url)
+    response = RedirectResponse(final_url)
+    _set_oauth_state_cookie(response, request, relay_state, encoded_state)
+    return response
 
 
 async def exchange_token_with_server(
@@ -1016,8 +1075,9 @@ async def callback(
             error_description,
         )
         if state:
+            encoded_state = _resolve_encoded_oauth_state(request, state)
             try:
-                state_data = decode_state_hash(state)
+                state_data = decode_state_hash(encoded_state)
                 original_state = state_data.get("original_state")
                 redirect_uri = _get_validated_client_redirect_uri(request, state_data)
             except HTTPException:
@@ -1036,7 +1096,9 @@ async def callback(
             if original_state is not None:
                 params["state"] = original_state
             complete_returned_url = _append_query_params(redirect_uri, params)
-            return RedirectResponse(url=complete_returned_url, status_code=302)
+            response = RedirectResponse(url=complete_returned_url, status_code=302)
+            _clear_oauth_state_cookie(response, request, state)
+            return response
 
         # No state — nothing to round-trip to. Show the user the error.
         return _render_oauth_error_html(error, error_description)
@@ -1052,7 +1114,8 @@ async def callback(
 
     # 3. Successful authorization response.
     try:
-        state_data = decode_state_hash(state)
+        encoded_state = _resolve_encoded_oauth_state(request, state)
+        state_data = decode_state_hash(encoded_state)
         original_state = state_data["original_state"]
 
         # Re-validate the client redirect URI at the sink. /authorize
@@ -1065,7 +1128,9 @@ async def callback(
 
         params = {"code": code, "state": original_state}
         complete_returned_url = _append_query_params(redirect_uri, params)
-        return RedirectResponse(url=complete_returned_url, status_code=302)
+        response = RedirectResponse(url=complete_returned_url, status_code=302)
+        _clear_oauth_state_cookie(response, request, state)
+        return response
 
     except HTTPException:
         # Re-raise so a non-loopback base_url surfaces as 400 instead of
