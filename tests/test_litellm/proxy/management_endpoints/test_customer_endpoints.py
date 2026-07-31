@@ -83,6 +83,40 @@ def test_update_customer_success(mock_prisma_client, mock_user_api_key_auth):
     assert response.json()["alias"] == "Updated Test User"
 
 
+def test_update_customer_unblock_with_blocked_false(mock_prisma_client, mock_user_api_key_auth):
+    """Regression test for #34379: blocked=False must reach the DB update.
+
+    The previous filter `v not in ([], {}, 0)` silently stripped booleans because
+    `False == 0` in Python, so users could block a customer but never unblock.
+    """
+    # Mock existing customer as blocked=True
+    mock_end_user = LiteLLM_EndUserTable(user_id="test-user-1", blocked=True)
+    # Mock the update response to echo back blocked=False
+    updated_mock_end_user = LiteLLM_EndUserTable(user_id="test-user-1", blocked=False)
+
+    mock_prisma_client.db.litellm_endusertable.find_first = AsyncMock(return_value=mock_end_user)
+    mock_prisma_client.db.litellm_endusertable.update = AsyncMock(return_value=updated_mock_end_user)
+
+    # Try to unblock the customer
+    test_data = {"user_id": "test-user-1", "blocked": False}
+    response = client.post("/customer/update", json=test_data, headers={"Authorization": "Bearer test-key"})
+
+    # Assert the request succeeded
+    assert response.status_code == 200
+
+    # Assert that blocked=False was forwarded to the DB update call.
+    # `update_end_user` calls `table.update(where=..., data=..., include=...)`,
+    # so data is passed as a kwarg.
+    update_mock = mock_prisma_client.db.litellm_endusertable.update
+    assert update_mock.await_count == 1, f"expected 1 update call, got {update_mock.await_count}"
+    call_kwargs = update_mock.call_args.kwargs
+    update_data = call_kwargs.get("data")
+    assert update_data is not None, f"update was called without `data` kwarg: {call_kwargs!r}"
+    assert update_data.get("blocked") is False, (
+        f"blocked=False was stripped by filter; update data was {update_data!r}"
+    )
+
+
 def test_update_customer_not_found(mock_prisma_client, mock_user_api_key_auth):
     """
     Test that update_end_user raises a 404 ProxyException when user_id does not exist.

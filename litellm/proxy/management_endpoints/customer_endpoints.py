@@ -546,7 +546,17 @@ async def update_end_user(
         # get non default values for key
         non_default_values = {}
         for k, v in data_json.items():
-            if v is not None and v not in (
+            if v is None:
+                continue
+            # Booleans are always intentional (True and False). Without this
+            # guard, `False` would be silently dropped because `False == 0`
+            # in Python makes `False not in ([], {}, 0)` evaluate to False —
+            # which is why `POST /customer/update` with `blocked=False` was
+            # a no-op (#34379).
+            if isinstance(v, bool):
+                non_default_values[k] = v
+                continue
+            if v not in (
                 [],
                 {},
                 0,
