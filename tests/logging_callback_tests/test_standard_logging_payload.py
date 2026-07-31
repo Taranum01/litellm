@@ -4,6 +4,7 @@ Unit tests for StandardLoggingPayloadSetup
 
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from unittest.mock import AsyncMock
@@ -244,6 +245,55 @@ def test_get_standard_logging_metadata_none_user_api_key():
     result = StandardLoggingPayloadSetup.get_standard_logging_metadata(metadata)
     all_fields_present(result)
     assert result["user_api_key_hash"] is None
+
+
+def test_user_api_key_hash_raw_sk_key_is_hashed():
+    """Raw ``sk-...`` arriving under ``user_api_key_hash`` must be hashed, not copied verbatim."""
+    raw_key = "sk-1234567890abcdefghijklmnop"
+    result = StandardLoggingPayloadSetup.get_standard_logging_metadata(
+        {"user_api_key_hash": raw_key}
+    )
+    assert result["user_api_key_hash"] != raw_key
+    # Result must be a 64-char hex SHA-256 (matches what auth layer produces)
+    assert re.fullmatch(r"[a-fA-F0-9]{64}", result["user_api_key_hash"])
+
+
+def test_user_api_key_hash_bearer_prefix_is_hashed():
+    """``Bearer sk-...`` value should have the prefix stripped then hashed."""
+    raw_key = "sk-1234567890abcdefghijklmnop"
+    result = StandardLoggingPayloadSetup.get_standard_logging_metadata(
+        {"user_api_key_hash": f"  Bearer {raw_key}  "}
+    )
+    assert result["user_api_key_hash"] != raw_key
+    assert re.fullmatch(r"[a-fA-F0-9]{64}", result["user_api_key_hash"])
+
+
+def test_user_api_key_hash_already_hashed_passes_through():
+    """A valid SHA-256 already in ``user_api_key_hash`` must be left unchanged."""
+    existing_hash = "a" * 64
+    result = StandardLoggingPayloadSetup.get_standard_logging_metadata(
+        {"user_api_key_hash": existing_hash}
+    )
+    assert result["user_api_key_hash"] == existing_hash
+
+
+def test_user_api_key_hash_none_and_empty_pass_through():
+    """None and empty string under ``user_api_key_hash`` must not be touched."""
+    for value in (None, ""):
+        result = StandardLoggingPayloadSetup.get_standard_logging_metadata(
+            {"user_api_key_hash": value}
+        )
+        assert result["user_api_key_hash"] == value
+
+
+def test_module_level_get_standard_logging_metadata_hashes_raw_key():
+    """The module-level builder must apply the same sanitization."""
+    from litellm.litellm_core_utils.litellm_logging import get_standard_logging_metadata
+
+    raw_key = "sk-1234567890abcdefghijklmnop"
+    result = get_standard_logging_metadata({"user_api_key_hash": raw_key})
+    assert result["user_api_key_hash"] != raw_key
+    assert re.fullmatch(r"[a-fA-F0-9]{64}", result["user_api_key_hash"])
 
 
 def test_get_standard_logging_metadata_invalid_keys():

@@ -4513,6 +4513,35 @@ def is_valid_sha256_hash(value: str) -> bool:
     return bool(re.fullmatch(r"[a-fA-F0-9]{64}", value))
 
 
+def _sanitize_user_api_key_hash(value: Any) -> Any:
+    """Ensure a value persisted as ``user_api_key_hash`` is a hash, never a raw credential.
+
+    The ``StandardLoggingMetadata.user_api_key_hash`` field is meant to hold a hash of
+    the virtual key. The builders below blind-copy it from caller metadata, so a raw
+    ``sk-...`` key or JWT placed in that field would otherwise be persisted in
+    cleartext to long-lived logging sinks (e.g. S3 request/response logs).
+
+    Delegating to ``UserAPIKeyAuth._safe_hash_litellm_api_key`` keeps the stored hash
+    consistent with what the auth layer produces elsewhere (covers ``sk-`` keys via
+    ``hash_token``, JWTs as ``hashed-jwt-<h>``, and strips a ``Bearer `` prefix).
+    Already-hashed values, non-strings, and falsy values pass through unchanged.
+    """
+    if not value or not isinstance(value, str):
+        return value
+    if is_valid_sha256_hash(value):
+        return value
+    candidate = value.strip()
+    if candidate[:7].lower() == "bearer ":
+        candidate = candidate[7:].strip()
+
+    # Lazy import: litellm_logging is imported by proxy._types, so importing it
+    # at module scope would create a circular import.
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    sanitized = UserAPIKeyAuth._safe_hash_litellm_api_key(candidate)
+    return sanitized if sanitized != candidate else value
+
+
 class StandardLoggingPayloadSetup:
     @staticmethod
     def cleanup_timestamps(
@@ -4695,6 +4724,12 @@ class StandardLoggingPayloadSetup:
             user_api_key = metadata.get("user_api_key")
             if user_api_key and isinstance(user_api_key, str) and is_valid_sha256_hash(user_api_key):
                 clean_metadata["user_api_key_hash"] = user_api_key
+            # Sanitize any raw credential that arrived under user_api_key_hash itself
+            # (the verbatim copy above would otherwise persist `sk-...` or JWTs in
+            # cleartext to long-lived log sinks).
+            clean_metadata["user_api_key_hash"] = _sanitize_user_api_key_hash(
+                clean_metadata.get("user_api_key_hash")
+            )
             _potential_requester_metadata = metadata.get(
                 "metadata", None
             )  # check if user passed metadata in the sdk request - e.g. metadata for langsmith logging - https://docs.litellm.ai/docs/observability/langsmith_integration#set-langsmith-fields
@@ -5538,6 +5573,12 @@ def get_standard_logging_metadata(
         if metadata.get("user_api_key") is not None:
             if is_valid_sha256_hash(str(metadata.get("user_api_key"))):
                 clean_metadata["user_api_key_hash"] = metadata.get("user_api_key")  # this is the hash
+        # Sanitize any raw credential that arrived under user_api_key_hash itself
+        # (the verbatim copy above would otherwise persist `sk-...` or JWTs in
+        # cleartext to long-lived log sinks).
+        clean_metadata["user_api_key_hash"] = _sanitize_user_api_key_hash(
+            clean_metadata.get("user_api_key_hash")
+        )
     return clean_metadata
 
 
